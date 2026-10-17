@@ -3,7 +3,6 @@ package com.focusguard.app.detection
 import android.content.Context
 import android.media.AudioAttributes
 import android.media.AudioManager
-import android.media.AudioPlaybackConfiguration
 import android.os.Build
 import android.util.Log
 
@@ -58,13 +57,17 @@ object MediaPlaybackDetector {
         // ② 更细粒度的播放配置（API 26+）。
         // 部分 ROM 会对非系统应用隐藏其他应用的播放配置，
         // 因此这一段只做"尽力而为"的增强，失败不影响 ① 的结论。
+        //
+        // 注意：不要用 AudioPlaybackConfiguration.getPlayerState()/
+        // PLAYER_STATE_STARTED —— 这两个符号不在公开 SDK 里（会编译失败）。
+        // getActivePlaybackConfigurations() 返回的列表本身就是"当前活跃的播放"，
+        // 直接用 getAudioAttributes() 区分媒体类/非媒体类即可。
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             try {
                 for (config in am.activePlaybackConfigurations) {
-                    if (config.playerState != AudioPlaybackConfiguration.PLAYER_STATE_STARTED) continue
-                    val attributes = config.audioAttributes
-                    val usage = attributes?.usage ?: AudioAttributes.USAGE_UNKNOWN
-                    val contentType = attributes?.contentType ?: AudioAttributes.CONTENT_TYPE_UNKNOWN
+                    val attributes = config.audioAttributes ?: continue
+                    val usage = attributes.usage
+                    val contentType = attributes.contentType
 
                     // 只认"媒体类"播放：通话、通知、闹钟、导航播报一律不算。
                     // 否则息屏时接个微信语音、或者导航播报，都会被当成在娱乐。
