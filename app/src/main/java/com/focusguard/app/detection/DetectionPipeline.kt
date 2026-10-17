@@ -1,10 +1,9 @@
 package com.focusguard.app.detection
 
 import android.content.Context
-import android.media.projection.MediaProjection
 import android.util.Log
 import com.focusguard.app.ai.AiClient
-import com.focusguard.app.capture.ScreenCapturer
+import com.focusguard.app.capture.FrameSource
 import com.focusguard.app.data.Settings
 import com.focusguard.app.token.DecisionCache
 import com.focusguard.app.token.ImageHasher
@@ -20,6 +19,8 @@ enum class DetectionSource {
     SCREEN_UNCHANGED, // 画面与上次几乎相同，复用上次结论，零 token
     CACHE_HIT,      // 感知哈希命中历史判定，零 token
     BLANK_SCREEN,   // 息屏/纯色屏，无识别价值，零 token
+    NO_FRAME,       // 无可用画面（息屏/屏幕共享结束/无障碍截图不可用）→ 事件层判定，零 token
+    MEDIA_PLAYBACK, // 无画面，但"媒体正在播放 + 前台是娱乐类应用"，零 token
     BUDGET_EXCEEDED, // 今日配额用尽，退化为本地判定
     AI_VISION,      // 视觉大模型判定，消耗 token
     PRIVACY_SKIP,   // 敏感应用隐私保护：不截屏、不读取、不上传
@@ -54,6 +55,10 @@ data class DetectionOutcome(
  *  L7 预算闸门      今日 token 配额耗尽 → 退化为本地保守判定
  *  L8 视觉大模型    以上都无法定论时才真正调用
  *
+ *  无画面分支：L4~L8 全部依赖画面。拿不到画面时（息屏、屏幕共享被
+ *  系统结束、无障碍截图不可用）不再当作错误，而是走事件层降级判定：
+ *  「媒体正在播放 + 前台是娱乐类应用」→ 判娱乐，否则中性。
+ *
  * 关键设计取舍：视频平台不因"是视频应用"就判娱乐。
  * B 站上的编程教程必须能被识别为学习，宁可多花一次 token，
  * 也不能误杀正常的学习行为。
@@ -62,7 +67,11 @@ class DetectionPipeline(
     private val context: Context,
     private val settings: Settings,
     private val aiClient: AiClient,
-    private val screenCapturer: ScreenCapturer,
+    /**
+     * 当前可用的画面通道。返回 null 表示此刻一条通道都没有
+     * （屏幕共享已结束、无障碍截图也不可用）——交给 [detectWithoutFrame]。
+     */
+    private val frameProvider: () -> FrameSource?,
     private val tokenBudget: TokenBudget,
     private val decisionCache: DecisionCache,
     private val categoryStore: AppCategoryStore
@@ -93,7 +102,7 @@ class DetectionPipeline(
     private val textPrefilterOn: Boolean get() = settings.screenTextPrefilterEnabled
     private val cacheOn: Boolean get() = settings.decisionCacheEnabled
 
-    suspend fun detect(projection: MediaProjection?): DetectionOutcome {
+    suspend fun detect(): DetectionOutcome {
         val appInfo = AppClassifier.classifyForegroundApp(context, categoryStore)
         val pkg = appInfo?.packageName.orEmpty()
         val label = appInfo?.label.ifNullOrBlank { pkg }
@@ -163,18 +172,15 @@ class DetectionPipeline(
             }
         }
 
-        // 以下步骤需要画面，先确认前置条件
-        if (projection == null) {
-            return DetectionOutcome(
-                "NEUTRAL", 0f, "屏幕录制不可用，跳过本轮",
-                DetectionSource.ERROR, pkg, label
-            )
+        // ── 以下步骤需要画面 ──────────────────────────
+        // 关键改动：取不到画面不再等于"检测失败"。屏幕共享在息屏/锁屏后
+        // 必然失效，若把它当成错误（旧实现还会顺手停掉整个守护服务），
+        // 用户一息屏这套软件就完全失效了。
+        val source = frameProvider()
+        val capture = source?.takeIf { it.available }?.grab()
+        if (capture == null) {
+            return detectWithoutFrame(pkg, label, source)
         }
-
-        val capture = screenCapturer.capture(projection)
-            ?: return DetectionOutcome(
-                "NEUTRAL", 0f, "截屏失败", DetectionSource.ERROR, pkg, label
-            )
 
         try {
             val hash = ImageHasher.dHash(capture.bitmap)
@@ -283,6 +289,92 @@ class DetectionPipeline(
             )
         } finally {
             capture.recycle()
+        }
+    }
+
+    /**
+     * 无画面时的降级判定（事件层）。
+     *
+     * 用的全是零成本信号：前台应用分类 + 媒体播放状态，不花一分钱 token。
+     * 判定刻意保守——**两个条件必须同时成立**才判娱乐：
+     *   1. 确实有媒体在播放（息屏挂着视频/直播/短视频的典型特征，通话/提示音不算）
+     *   2. 前台（或最近前台）应用属于**高可信度**的游戏 / 长视频 / 短视频类
+     *
+     * 两个刻意的保守取舍：
+     *  · 分类只认内置静态表与用户手动指定，**不采用元数据推断**——
+     *    推断靠包名/名称关键字（例如 "tv"），没有画面佐证时误判代价太大。
+     *  · **社交类不参与**（微信、QQ、小红书里的声音多半是语音消息或视频通话）。
+     *
+     * 一句话：宁可漏判，也不能把边听歌、听语音的用户锁在外面。
+     */
+    private fun detectWithoutFrame(
+        pkg: String,
+        label: String,
+        source: FrameSource?
+    ): DetectionOutcome {
+        // 息屏后 queryUsageStats 常常读不到事件，退回"最近前台应用"缓存
+        val effectivePackage = if (pkg.isNotBlank()) pkg else recentForegroundPackage().orEmpty()
+        val effectiveLabel = label.ifBlank { appLabelOf(effectivePackage) }
+
+        // 高可信度分类：内置静态表 + 用户手动覆盖（取舍见方法注释）
+        val category = AppClassifier.builtinCategory(effectivePackage)
+            ?: categoryStore.getUserOverride(effectivePackage)
+
+        val media = try {
+            MediaPlaybackDetector.snapshot(context)
+        } catch (e: Exception) {
+            Log.w(TAG, "读取媒体播放状态失败：${e.message}")
+            null
+        }
+
+        // 只认明确的娱乐类应用；社交类不参与无画面判定（见上方说明）
+        val entertainmentCategory = category == AppCategory.GAME ||
+            category == AppCategory.VIDEO ||
+            category == AppCategory.SHORT_VIDEO
+
+        if (media != null && media.playing && entertainmentCategory) {
+            val name = effectiveLabel.ifBlank { effectivePackage }
+            val kind = if (media.movieLike) "视频/媒体" else "音频"
+            val reason = "无画面但检测到${kind}正在播放（${media.detail}），" +
+                "且前台是娱乐类应用：$name"
+            return saved(
+                DetectionOutcome(
+                    "ENTERTAINMENT", 0.75f, reason,
+                    DetectionSource.MEDIA_PLAYBACK, effectivePackage, effectiveLabel
+                )
+            )
+        }
+
+        val reason = when {
+            source == null ->
+                "无可用画面通道（屏幕共享已结束，无障碍截图也不可用），本轮仅做事件层判定"
+            !source.available ->
+                "${source.name} 通道当前不可用，本轮仅做事件层判定"
+            else ->
+                "${source.name} 通道取不到画面（可能已息屏/锁屏），本轮仅做事件层判定"
+        }
+        return DetectionOutcome(
+            "NEUTRAL", 0.2f, reason,
+            DetectionSource.NO_FRAME, effectivePackage, effectiveLabel
+        )
+    }
+
+    /** 最近一次前台应用包名（使用统计事件缓存，息屏后仍然可读）。 */
+    private fun recentForegroundPackage(): String? = try {
+        com.focusguard.app.service.ForegroundAppDetector.current(context)
+            ?.takeIf { it != context.packageName }
+    } catch (e: Exception) {
+        null
+    }
+
+    /** 包名 → 应用名，读不到就退回包名。 */
+    private fun appLabelOf(packageName: String): String {
+        if (packageName.isBlank()) return ""
+        return try {
+            val pm = context.packageManager
+            pm.getApplicationLabel(pm.getApplicationInfo(packageName, 0)).toString()
+        } catch (e: Exception) {
+            packageName
         }
     }
 

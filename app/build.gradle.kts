@@ -3,6 +3,26 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+// ── 签名密钥 ──────────────────────────────────────────────────
+// 稳定证书只保存在 GitHub Secrets（或本机仓库外的受限目录），不进公开仓库。
+// 拿不到证书时自动退回系统默认 debug 签名，保证"fork 之后直接构建也能出包"，
+// 而不是抛 Keystore file not found 让构建失败。
+val sharedKeystoreFile = rootProject.file("keystore/focusguard-release.p12")
+
+val sharedStorePassword: String =
+    System.getenv("FOCUSGUARD_STORE_PASSWORD")
+        ?: providers.gradleProperty("focusguardStorePassword").orNull ?: ""
+val sharedKeyAlias: String =
+    System.getenv("FOCUSGUARD_KEY_ALIAS")
+        ?: providers.gradleProperty("focusguardKeyAlias").orNull ?: ""
+val sharedKeyPassword: String =
+    System.getenv("FOCUSGUARD_KEY_PASSWORD")
+        ?: providers.gradleProperty("focusguardKeyPassword").orNull ?: ""
+
+/** 证书文件与口令都齐备时才启用固定签名，否则交给系统默认签名。 */
+val canUseSharedSigning: Boolean =
+    sharedKeystoreFile.exists() && sharedStorePassword.isNotBlank() && sharedKeyAlias.isNotBlank()
+
 android {
     namespace = "com.focusguard.app"
     compileSdk = 36
@@ -19,14 +39,11 @@ android {
     // 所有后续构建证书一致，支持覆盖安装升级。
     signingConfigs {
         create("shared") {
-            storeFile = rootProject.file("keystore/focusguard-release.p12")
+            storeFile = sharedKeystoreFile
             storeType = "PKCS12"
-            storePassword = System.getenv("FOCUSGUARD_STORE_PASSWORD")
-                ?: providers.gradleProperty("focusguardStorePassword").orNull ?: ""
-            keyAlias = System.getenv("FOCUSGUARD_KEY_ALIAS")
-                ?: providers.gradleProperty("focusguardKeyAlias").orNull ?: ""
-            keyPassword = System.getenv("FOCUSGUARD_KEY_PASSWORD")
-                ?: providers.gradleProperty("focusguardKeyPassword").orNull ?: ""
+            storePassword = sharedStorePassword
+            keyAlias = sharedKeyAlias
+            keyPassword = sharedKeyPassword
         }
     }
 
@@ -37,11 +54,12 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            signingConfig = signingConfigs.getByName("shared")
+            if (canUseSharedSigning) signingConfig = signingConfigs.getByName("shared")
         }
         debug {
             isMinifyEnabled = false
-            signingConfig = signingConfigs.getByName("shared")
+            // 无固定证书时保持系统默认 debug 签名，任何人都能构建安装
+            if (canUseSharedSigning) signingConfig = signingConfigs.getByName("shared")
         }
     }
 

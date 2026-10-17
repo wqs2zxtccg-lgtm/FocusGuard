@@ -6,16 +6,20 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import android.util.Log
 import com.focusguard.app.FocusGuardApp
 import com.focusguard.app.MainActivity
 import com.focusguard.app.R
 import com.focusguard.app.ai.AiClient
-import com.focusguard.app.capture.ScreenCapturer
+import com.focusguard.app.capture.AccessibilityFrameSource
+import com.focusguard.app.capture.FrameSource
+import com.focusguard.app.capture.MediaProjectionFrameSource
 import com.focusguard.app.data.DetectionLog
 import com.focusguard.app.data.LockState
 import com.focusguard.app.data.LogStore
@@ -25,6 +29,7 @@ import com.focusguard.app.detection.AppClassifier
 import com.focusguard.app.detection.DetectionOutcome
 import com.focusguard.app.detection.DetectionPipeline
 import com.focusguard.app.detection.DetectionSource
+import com.focusguard.app.detection.MediaPlaybackDetector
 import com.focusguard.app.enforce.AppBlockActivity
 import com.focusguard.app.enforce.Enforcer
 import com.focusguard.app.token.AdaptiveScheduler
@@ -52,6 +57,9 @@ class MonitorService : Service() {
         private const val ACTION_STOP = "com.focusguard.app.STOP"
         private const val ACTION_TEST = "com.focusguard.app.TEST"
         private const val ACTION_RESURRECT = "com.focusguard.app.RESURRECT"
+
+        /** 不申请屏幕共享，直接用无障碍截图 + 事件层判定启动守护。 */
+        private const val ACTION_START_TEXT_ONLY = "com.focusguard.app.START_TEXT_ONLY"
 
         /** 使用时长闸门的采样间隔（毫秒）。比 AI 检测间隔密得多，才能及时拦截。 */
         const val USAGE_TICK_MS = 15_000L
@@ -98,6 +106,17 @@ class MonitorService : Service() {
         @Volatile
         var smartReason: String = ""
 
+        /**
+         * 当前生效的画面采集通道名。
+         * 空串表示"没有任何画面通道"，此时判定完全依赖事件层信号
+         * （前台应用 + 屏幕文字 + 媒体播放状态），守护仍然有效。
+         */
+        @Volatile
+        var captureChannel: String = ""
+
+        /** 采集通道文案，供 UI/通知展示。 */
+        fun captureChannelText(): String = captureChannel.ifBlank { "无画面（事件层判定）" }
+
         /** 诊断文本：给用户看的守护健康状态。 */
         fun healthText(): String {
             if (!isRunning) return "守护未运行"
@@ -109,6 +128,8 @@ class MonitorService : Service() {
                 append(if (tickAgo < 0) "尚未开始" else "${tickAgo}s 前")
                 append(" · AI 检测：")
                 append(if (detectAgo < 0) "尚未执行" else "${detectAgo}s 前")
+                append("\n画面通道：")
+                append(captureChannelText())
                 if (!isLoopAlive()) append(" ⚠️ 循环已停止")
                 // 智能调度状态：下次检测倒计时 + 风险分
                 if (smartIntervalSeconds > 0) {
@@ -126,6 +147,26 @@ class MonitorService : Service() {
                 putExtra("resultCode", resultCode)
                 putExtra("data", data)
             }
+            launch(context, intent)
+        }
+
+        /**
+         * 启动守护，但**不申请屏幕共享授权**。
+         *
+         * 适用场景：无障碍服务已开启（API 30+ 可截图）。
+         * 这样不再弹系统授权框，也不会因为息屏被系统"结束共享"；
+         * 检测通道由无障碍截图 + 屏幕文字 + 应用分类 + 媒体播放状态组成。
+         */
+        fun startWithoutScreenShare(context: Context) {
+            launch(
+                context,
+                Intent(context, MonitorService::class.java).apply {
+                    action = ACTION_START_TEXT_ONLY
+                }
+            )
+        }
+
+        private fun launch(context: Context, intent: Intent) {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 context.startForegroundService(intent)
             } else {
@@ -178,9 +219,18 @@ class MonitorService : Service() {
     /** 上次检测是否失败（智能调度的退避依据）。 */
     private var lastDetectionWasError = false
 
-    private var screenCapturer: ScreenCapturer? = null
+    /** 屏幕共享通道（可能从未建立，也可能中途被系统回收）。 */
     private var mediaProjection: MediaProjection? = null
+    private var mediaFrameSource: FrameSource? = null
+
+    /** 无障碍截图通道：常驻。无障碍服务被回收时它会自动变为不可用。 */
+    private val accessibilityFrameSource = AccessibilityFrameSource()
+
     private var pipeline: DetectionPipeline? = null
+
+    /** 上次巡检时屏幕是否亮着，用于识别"刚亮屏"并立刻补一次检测。 */
+    private var lastScreenInteractive = true
+
     /** 是否处于「使用时长触发」的加密检测模式。 */
     private var usageTriggeredDetection = false
 
@@ -191,22 +241,21 @@ class MonitorService : Service() {
     /** 提醒→锁机 宽限期任务（用户切回学习可免锁）。 */
     private var gracePeriodJob: Job? = null
 
-    /** MediaProjection 被系统或用户回收时同步停止服务，避免无声空转。 */
+    /**
+     * MediaProjection 被系统或用户回收时的处理。
+     *
+     * 关键改动（本文件最重要的修复）：
+     * **投影失效不再等于守护结束**。
+     *
+     * 旧实现在这里直接 stopMonitoring()，于是"手机一息屏 → 系统结束屏幕共享
+     * → 整个守护停摆、必须手动重新授权"——这正是本次要解决的问题。
+     * 现在只断开这条采集通道，巡检循环继续跑，自动退回到
+     * 无障碍截图 / 屏幕文字 / 应用分类 / 媒体播放状态这些不依赖投影的信号。
+     */
     private val projectionCallback = object : MediaProjection.Callback() {
         override fun onStop() {
-            Log.w(TAG, "MediaProjection 已被系统停止")
-            stopMonitoring()
-            // 提示用户恢复：打开应用会自动重新授权（后台无法自动恢复投影）
-            try {
-                com.focusguard.app.service.AlertNotifier.alert(
-                    this@MonitorService,
-                    "AI 守护已中断",
-                    "屏幕录制授权被系统回收，打开专注卫士将自动恢复检测",
-                    id = 1007
-                )
-            } catch (e: Exception) {
-                Log.w(TAG, "发送恢复提醒失败：${e.message}")
-            }
+            Log.w(TAG, "MediaProjection 已被系统停止（多为息屏/锁屏或被回收）")
+            detachProjection("屏幕共享已结束")
         }
     }
 
@@ -233,31 +282,35 @@ class MonitorService : Service() {
                 if (data != null) {
                     startMonitoring(resultCode, data)
                 } else {
-                    Log.e(TAG, "缺少 MediaProjection 授权数据，无法启动")
-                    stopSelf()
+                    // 没有授权数据也不再自尽：退回不依赖投影的守护模式
+                    Log.w(TAG, "缺少屏幕共享授权数据，改为无画面模式启动")
+                    startTextOnlyMonitoring("缺少屏幕共享授权数据")
                 }
             }
+            ACTION_START_TEXT_ONLY -> startTextOnlyMonitoring("以无屏幕共享模式启动")
             ACTION_STOP -> stopMonitoring()
             ACTION_TEST -> serviceScope.launch { performDetection(isManualTest = true) }
-            // 自愈：检测循环意外停止但投影仍有效 → 重启循环
+            // 自愈：循环意外停止 → 无条件重启（不再要求投影仍然有效）
             ACTION_RESURRECT -> {
                 Log.d(TAG, "收到复活指令（循环是否存活=${monitorJob?.isActive == true}）")
-                if (pipeline != null && monitorJob?.isActive != true) {
+                ensurePipeline()
+                if (monitorJob?.isActive != true) {
                     startMonitoringLoop()
                     Log.d(TAG, "检测循环已复活")
-                } else if (pipeline == null) {
-                    Log.w(TAG, "投影已失效，无法复活（等待重新授权）")
-                    notifyNeedReauth()
                 }
             }
             // 系统在资源紧张时杀掉服务后重建（START_STICKY）：
-            // MediaProjection 授权无法自动重放，此时不做检测，
-            // 但锁机状态仍由 LockState 持久化 + LockScreenActivity 兜底，
-            // 不会被这次重建绕过。发通知提醒用户一键恢复。
+            // 屏幕共享授权无法自动重放，但守护不该因此失效——
+            // 只要用户之前开着守护，就用事件层判定继续跑。
             null -> {
-                Log.w(TAG, "服务被系统重建（无授权数据），保持运行但等待重新授权")
-                startForeground(FocusGuardApp.NOTIFICATION_ID, buildNotification(null))
-                notifyNeedReauth()
+                if (settings.serviceRunning) {
+                    Log.w(TAG, "服务被系统重建（无授权数据），以无画面模式继续守护")
+                    startTextOnlyMonitoring("服务被系统重建")
+                } else {
+                    Log.w(TAG, "服务被系统重建且用户并未开启守护，直接结束")
+                    startForegroundCompat(buildNotification(null))
+                    stopSelf()
+                }
             }
         }
         // START_STICKY：服务被杀后系统会重建。
@@ -266,7 +319,12 @@ class MonitorService : Service() {
         return START_STICKY
     }
 
-    /** 检测服务中断（无 MediaProjection）时发通知，点击通知回应用自动重新授权。 */
+    /**
+     * 既没有屏幕共享、也没有无障碍截图时发通知。
+     *
+     * 注意语义变化：这**不是**"守护已中断"。守护仍在跑，
+     * 只是暂时看不到画面（仅靠应用分类 + 媒体播放状态判定）。
+     */
     private fun notifyNeedReauth() {
         try {
             val pendingIntent = PendingIntent.getActivity(
@@ -279,8 +337,8 @@ class MonitorService : Service() {
             )
             val notification = Notification.Builder(this, FocusGuardApp.CHANNEL_ID)
                 .setSmallIcon(R.drawable.ic_shield)
-                .setContentTitle("AI 守护已中断")
-                .setContentText("点击打开应用，将自动重新请求屏幕录制授权并恢复检测")
+                .setContentTitle("检测通道受限")
+                .setContentText("守护仍在运行，但暂时取不到画面。开启无障碍服务可恢复画面识别，点此进入应用")
                 .setContentIntent(pendingIntent)
                 .setAutoCancel(true)
                 .build()
@@ -294,7 +352,9 @@ class MonitorService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     private fun startMonitoring(resultCode: Int, data: Intent) {
-        startForeground(FocusGuardApp.NOTIFICATION_ID, buildNotification(null))
+        // 先进入前台：Android 14+ 要求前台服务（mediaProjection 类型）先就位，
+        // 再取投影授权，顺序与旧实现保持一致（这个顺序是验证过可用的）。
+        startForegroundCompat(buildNotification(null), projectionType = true)
 
         val manager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         val projection = try {
@@ -305,25 +365,17 @@ class MonitorService : Service() {
         }
 
         if (projection == null) {
-            stopSelf()
+            // 授权数据无效也不结束守护：退回到不依赖画面的判定
+            // （startTextOnlyMonitoring 会把前台服务类型换回 specialUse）
+            Log.w(TAG, "屏幕共享授权无效，转为无画面模式")
+            startTextOnlyMonitoring("屏幕共享授权无效")
             return
         }
 
         // Android 14 起必须在 createVirtualDisplay 之前注册回调
         projection.registerCallback(projectionCallback, null)
-
-        val capturer = ScreenCapturer(this)
         mediaProjection = projection
-        screenCapturer = capturer
-        pipeline = DetectionPipeline(
-            context = this,
-            settings = settings,
-            aiClient = aiClient,
-            screenCapturer = capturer,
-            tokenBudget = tokenBudget,
-            decisionCache = decisionCache,
-            categoryStore = categoryStore
-        )
+        mediaFrameSource = MediaProjectionFrameSource(this, projection)
 
         settings.serviceRunning = true
         isRunning = true
@@ -331,8 +383,162 @@ class MonitorService : Service() {
         scheduler = AdaptiveScheduler(settings.intervalMinutes)
         smartScheduler = com.focusguard.app.token.SmartScheduler(settings.intervalMinutes)
 
+        ensurePipeline()
+        updateCaptureChannel()
         startMonitoringLoop()
-        Log.d(TAG, "守护已启动，检测间隔 ${settings.intervalMinutes} 分钟")
+        Log.d(TAG, "守护已启动，采集通道 ${captureChannelText()}，间隔 ${settings.intervalMinutes} 分钟")
+    }
+
+    /**
+     * 以「无画面模式」启动或续跑守护。
+     *
+     * 完全不依赖 MediaProjection：判定来自无障碍截图（若可用）、屏幕文字、
+     * 前台应用分类与媒体播放状态。这正是"屏幕共享结束后守护不再失效"的落点。
+     */
+    private fun startTextOnlyMonitoring(reason: String) {
+        Log.d(TAG, "进入无画面守护模式：$reason")
+
+        if (settings.serviceRunning) {
+            // 已经在守护中，这只是通道降级，不要重复初始化调度器
+            startForegroundCompat(buildNotification(lastOutcome))
+        } else {
+            startForegroundCompat(buildNotification(null))
+        }
+
+        settings.serviceRunning = true
+        isRunning = true
+        consecutiveViolations = 0
+        if (scheduler == null) scheduler = AdaptiveScheduler(settings.intervalMinutes)
+        if (smartScheduler == null) {
+            smartScheduler = com.focusguard.app.token.SmartScheduler(settings.intervalMinutes)
+        }
+
+        ensurePipeline()
+        updateCaptureChannel()
+        if (monitorJob?.isActive != true) startMonitoringLoop()
+        Log.d(TAG, "无画面守护已就绪，采集通道 ${captureChannelText()}")
+
+        // 连无障碍截图也没有时，提示用户开启无障碍，否则只能靠应用分类与媒体播放
+        if (currentFrameSource() == null) notifyNeedReauth()
+    }
+
+    /** 懒创建检测流水线。画面通道用 provider 注入，投影随时可断可接。 */
+    private fun ensurePipeline(): DetectionPipeline {
+        pipeline?.let { return it }
+        val created = DetectionPipeline(
+            context = this,
+            settings = settings,
+            aiClient = aiClient,
+            frameProvider = { currentFrameSource() },
+            tokenBudget = tokenBudget,
+            decisionCache = decisionCache,
+            categoryStore = categoryStore
+        )
+        pipeline = created
+        return created
+    }
+
+    /** 当前可用的画面通道：屏幕共享优先（信息最全），其次无障碍截图。 */
+    private fun currentFrameSource(): FrameSource? {
+        mediaFrameSource?.let { if (it.available) return it }
+        return accessibilityFrameSource.takeIf { it.available }
+    }
+
+    /** 刷新采集通道状态，供 UI 与通知展示。 */
+    private fun updateCaptureChannel() {
+        captureChannel = currentFrameSource()?.name.orEmpty()
+    }
+
+    /**
+     * 断开屏幕共享通道，但**保持守护运行**。
+     *
+     * 旧实现遇到投影失效会直接 stopMonitoring()，"息屏→共享结束→守护停摆"
+     * 就是这么来的。现在只释放这一条通道，巡检循环继续，
+     * 判定自动退回到无障碍截图 / 文字 / 应用分类 / 媒体播放。
+     */
+    private fun detachProjection(reason: String) {
+        val hadProjection = mediaProjection != null
+
+        try {
+            mediaProjection?.unregisterCallback(projectionCallback)
+        } catch (_: Exception) {
+        }
+        try {
+            mediaFrameSource?.release()
+        } catch (e: Exception) {
+            Log.w(TAG, "释放屏幕共享通道失败：${e.message}")
+        }
+        // 刻意不在这里调 mediaProjection.stop()：
+        // 本函数会从 MediaProjection.Callback.onStop() 内部被调用，
+        // 在回调里再 stop() 有可能与框架的投影锁互相等待（已知死锁形态）。
+        // 系统既然已经回调 onStop，说明投影本身已经停了，无需重复停止。
+        mediaFrameSource = null
+        mediaProjection = null
+        updateCaptureChannel()
+
+        if (!hadProjection) return
+
+        // 降级前台服务类型：mediaProjection 类型要求当下持有有效授权
+        try {
+            startForegroundCompat(buildNotification(lastOutcome))
+        } catch (e: Exception) {
+            Log.w(TAG, "降级前台服务类型失败：${e.message}")
+        }
+
+        // 巡检循环必须还活着：投影断了只是少一只眼睛
+        if (monitorJob?.isActive != true) {
+            ensurePipeline()
+            startMonitoringLoop()
+        }
+
+        if (currentFrameSource() == null) {
+            try {
+                AlertNotifier.alert(
+                    this,
+                    "已切换为无画面守护",
+                    "$reason。守护仍在运行，将继续按应用分类与媒体播放状态检测；" +
+                        "开启无障碍服务可恢复画面识别",
+                    id = 1007
+                )
+            } catch (e: Exception) {
+                Log.w(TAG, "发送通道切换提醒失败：${e.message}")
+            }
+        }
+    }
+
+    /**
+     * 启动前台服务并按当前是否持有屏幕共享选择前台服务类型。
+     *
+     * Android 14+ 用 mediaProjection 类型启动前台服务时，系统会校验 App
+     * 当下确实持有有效投影授权；无画面模式必须换成 specialUse，
+     * 否则会直接抛 SecurityException 把服务打挂。
+     */
+    private fun startForegroundCompat(
+        notification: Notification,
+        projectionType: Boolean = mediaProjection != null
+    ) {
+        val id = FocusGuardApp.NOTIFICATION_ID
+        val wantsProjection = projectionType
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            val preferred = if (wantsProjection) {
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+            } else {
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+            }
+            try {
+                startForeground(id, notification, preferred)
+                return
+            } catch (e: Exception) {
+                Log.w(TAG, "以前台服务类型 $preferred 启动失败：${e.message}")
+            }
+            // 兜底：按无画面类型再试一次，保证通知栏的守护标记一定挂上
+            startForeground(id, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && wantsProjection) {
+            startForeground(id, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+        } else {
+            startForeground(id, notification)
+        }
     }
 
     private fun stopMonitoring() {
@@ -344,9 +550,9 @@ class MonitorService : Service() {
         } catch (_: Exception) {
         }
         try {
-            screenCapturer?.close()
+            mediaFrameSource?.release()
         } catch (e: Exception) {
-            Log.w(TAG, "关闭截屏器失败：${e.message}")
+            Log.w(TAG, "关闭屏幕共享通道失败：${e.message}")
         }
         try {
             mediaProjection?.stop()
@@ -354,9 +560,10 @@ class MonitorService : Service() {
             Log.w(TAG, "停止投影失败（已停止则忽略）：${e.message}")
         }
 
-        screenCapturer = null
+        mediaFrameSource = null
         mediaProjection = null
         pipeline = null
+        captureChannel = ""
 
         // 状态复位必须在 try 之外：
         // 此前 mediaProjection.stop() 在部分 ROM 上抛异常会中断本函数，
@@ -384,6 +591,15 @@ class MonitorService : Service() {
                 try {
                     delay(USAGE_TICK_MS)
                     if (!isActive) break
+
+                    // 亮屏边沿：刚点亮屏幕立刻补一次检测，
+                    // 不让"息屏期间攒下的违规"等到下一个周期才被发现
+                    val interactive = isScreenInteractive()
+                    if (interactive && !lastScreenInteractive) {
+                        Log.d(TAG, "屏幕点亮，立即执行一次检测")
+                        msUntilNextDetection = 0L
+                    }
+                    lastScreenInteractive = interactive
 
                     // 锁机兜底：锁机状态激活但锁机页不在前台（被最近任务/滑动销毁、
                     // 进程被杀后服务重建）时，自动重新拉起锁机页
@@ -414,6 +630,9 @@ class MonitorService : Service() {
 
                     // 心跳：证明循环还活着（排查"守护开着但不检测"用）
                     lastTickAt = System.currentTimeMillis()
+
+                    // 采集通道可能随时变化（无障碍被开启/被系统回收），同步给 UI 与通知
+                    updateCaptureChannel()
 
                     msUntilNextDetection -= USAGE_TICK_MS
                     if (msUntilNextDetection <= 0) {
@@ -465,11 +684,7 @@ class MonitorService : Service() {
         val smart = smartScheduler
         if (settings.smartScheduleEnabled && smart != null) {
             smart.updateBase(currentInterval)
-            val screenOn = try {
-                getSystemService(android.os.PowerManager::class.java)?.isInteractive ?: true
-            } catch (e: Exception) {
-                true
-            }
+            val screenOn = isScreenInteractive()
             val fg = try {
                 com.focusguard.app.detection.AppClassifier
                     .classifyForegroundApp(this, categoryStore)?.packageName
@@ -478,15 +693,27 @@ class MonitorService : Service() {
             }
             // 让调度器学习该应用的停留时长
             smart.onForegroundApp(fg)
-            val seconds = smart.nextDelaySeconds(
+            var seconds = smart.nextDelaySeconds(
                 screenOn = screenOn,
                 foregroundPackage = fg,
                 lastWasError = lastDetectionWasError
             )
+            // 息屏但媒体仍在播放（挂着视频/直播/短视频）时不能按省电上限睡过去，
+            // 否则锁屏挂着视频就能一直躲过检测
+            val mediaPlayingWithScreenOff =
+                !screenOn && MediaPlaybackDetector.isPlaying(this)
+            if (mediaPlayingWithScreenOff) {
+                val awakeInterval = (currentInterval * 60L).coerceAtLeast(30L)
+                if (seconds > awakeInterval) seconds = awakeInterval
+            }
             // 暴露给 UI 展示
             smartIntervalSeconds = seconds
             smartRiskPercent = (smart.currentRisk() * 100).toInt()
-            smartReason = smart.lastReason
+            smartReason = if (mediaPlayingWithScreenOff) {
+                "息屏但仍有媒体在播放，保持常规检测频率（${smart.lastReason}）"
+            } else {
+                smart.lastReason
+            }
             return seconds * 1000L
         }
 
@@ -499,6 +726,13 @@ class MonitorService : Service() {
             return delayMs.coerceAtLeast(currentInterval * 30_000L)
         }
         return currentInterval * 60_000L
+    }
+
+    /** 屏幕是否亮着（PowerManager 不可用时按"亮着"处理，宁可多检测不漏判）。 */
+    private fun isScreenInteractive(): Boolean = try {
+        getSystemService(PowerManager::class.java)?.isInteractive ?: true
+    } catch (e: Exception) {
+        true
     }
 
     /**
@@ -548,7 +782,8 @@ class MonitorService : Service() {
     }
 
     private suspend fun performDetection(isManualTest: Boolean) {
-        val activePipeline = pipeline ?: return
+        // 流水线按需创建：即使没有屏幕共享也能工作（无画面走事件层判定）
+        val activePipeline = ensurePipeline()
 
         // 锁机期间无需继续检测，省电也省 token
         if (!isManualTest && lockState.isLocked) {
@@ -557,7 +792,7 @@ class MonitorService : Service() {
         }
 
         val outcome = try {
-            activePipeline.detect(mediaProjection)
+            activePipeline.detect()
         } catch (e: kotlinx.coroutines.CancellationException) {
             // 协程真正被取消（服务停止/被杀）→ 静默向上传播，不记录假错误。
             // 注意：判断要反过来——此前写成 isActive 时 rethrow，导致
@@ -776,8 +1011,9 @@ class MonitorService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
+        val channelSuffix = "\n画面通道：" + captureChannelText()
         val text = when {
-            outcome == null -> getString(R.string.notification_text)
+            outcome == null -> getString(R.string.notification_text) + channelSuffix
             else -> buildString {
                 append("判断：")
                 append(
@@ -798,6 +1034,7 @@ class MonitorService : Service() {
                     append(" · ")
                     append(outcome.reason.replace('\n', ' ').take(80))
                 }
+                append(channelSuffix)
             }
         }
 
@@ -818,7 +1055,10 @@ class MonitorService : Service() {
     override fun onDestroy() {
         super.onDestroy()
         serviceScope.cancel()
-        settings.serviceRunning = false
+        // 刻意**不**在这里清掉 settings.serviceRunning：
+        // 这个标记表示"用户开着守护"，只有用户在界面上停止守护时才该被清掉
+        // （见 stopMonitoring）。系统因内存回收等原因销毁本服务时也会走 onDestroy，
+        // 若在这里清标记，START_STICKY 重建后就再也接不上守护了。
         isRunning = false
     }
 }

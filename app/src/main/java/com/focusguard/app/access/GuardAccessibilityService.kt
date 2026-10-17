@@ -3,7 +3,16 @@ package com.focusguard.app.access
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.AccessibilityServiceInfo
 import android.content.Intent
+import android.graphics.Bitmap
+import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
+import android.view.Display
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executor
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityWindowInfo
 import com.focusguard.app.data.LockState
@@ -76,6 +85,89 @@ class GuardAccessibilityService : AccessibilityService() {
                 pkg.contains("side", ignoreCase = true) ||
                 pkg == "com.huawei.systemmanager" ||
                 pkg == "com.hihonor.systemmanager"
+
+        // ── 无障碍截图通道 ──────────────────────────────────────────
+        // 动机：MediaProjection（系统"屏幕共享"）在息屏/锁屏/被系统回收后会失效，
+        // 而且每次恢复都必须由用户手动点确认——这正是"息屏就断"的根因。
+        // API 30+ 的无障碍服务可以自行截屏，不需要任何授权弹窗，
+        // 只要服务还活着就能随时取一帧，成为投影之外的第二条采集通道。
+
+        /** 无障碍截图当前是否可用（API 30+ 且服务已连接）。 */
+        val screenshotCapable: Boolean
+            get() = Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && instance != null
+
+        /**
+         * 同步截取一帧屏幕（含状态栏的整屏）。失败返回 null。
+         *
+         * 必须在**非主线程**调用：回调投递在主线程 Looper 上，在主线程等待会自锁。
+         * 调用方用完请 recycle 返回的 Bitmap。
+         */
+        fun captureScreenSync(timeoutMs: Long = 1500L): Bitmap? {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return null
+            val service = instance ?: return null
+            return try {
+                service.takeScreenshotBlocking(timeoutMs)
+            } catch (e: Exception) {
+                Log.w(TAG, "无障碍截图异常：${e.message}")
+                null
+            }
+        }
+    }
+
+    /**
+     * 向系统请求一帧截图并等待回调。
+     *
+     * 系统对无障碍截图有频率限制（约 300ms 一次），本项目检测间隔远大于此，
+     * 不会触发限流；持续失败通常意味着屏幕已熄灭或服务被回收，
+     * 由上层退回事件层判定即可。
+     *
+     * 注：调用方必须先确认 `Build.VERSION.SDK_INT >= 30`（见 [captureScreenSync]）。
+     */
+    private fun takeScreenshotBlocking(timeoutMs: Long): Bitmap? {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            Log.w(TAG, "无障碍截图不能在主线程调用，已跳过")
+            return null
+        }
+
+        val latch = CountDownLatch(1)
+        val holder = AtomicReference<Bitmap?>(null)
+        val mainHandler = Handler(Looper.getMainLooper())
+        val executor = Executor { command -> mainHandler.post(command) }
+
+        val callback = object : AccessibilityService.TakeScreenshotCallback {
+            override fun onSuccess(result: AccessibilityService.ScreenshotResult) {
+                try {
+                    val buffer = result.hardwareBuffer
+                    try {
+                        val wrapped = Bitmap.wrapHardwareBuffer(buffer, result.colorSpace)
+                        // wrapHardwareBuffer 返回的是硬件位图，必须先拷成软件位图
+                        // 才能做缩放/JPEG 压缩（也避免缓冲区被回收后位图失效）
+                        holder.set(wrapped?.copy(Bitmap.Config.ARGB_8888, false))
+                    } finally {
+                        buffer.close()
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "解析无障碍截图失败：${e.message}")
+                } finally {
+                    latch.countDown()
+                }
+            }
+
+            override fun onFailure(errorCode: Int) {
+                Log.d(TAG, "无障碍截图被拒绝，错误码=$errorCode")
+                latch.countDown()
+            }
+        }
+
+        try {
+            takeScreenshot(Display.DEFAULT_DISPLAY, executor, callback)
+        } catch (e: Exception) {
+            Log.w(TAG, "发起无障碍截图失败：${e.message}")
+            return null
+        }
+
+        latch.await(timeoutMs, TimeUnit.MILLISECONDS)
+        return holder.get()
     }
 
     private var lockState: LockState? = null

@@ -80,8 +80,9 @@ fun PermissionSetupScreen(
             ),
             PermissionItem(
                 key = "screen_capture",
-                title = "屏幕录制",
-                description = "AI 视觉识别的基础。点击「开始守护」时会弹出系统授权框",
+                title = "屏幕录制（可选）",
+                description = "画面识别通道之一。已开启无障碍时无需它也能识别（无障碍截图不会因息屏被系统结束）；" +
+                    "需要重新弹出系统授权框时点这里",
                 icon = Icons.Default.Screenshot,
                 isGranted = settings.screenCaptureGranted,
                 isRequired = false

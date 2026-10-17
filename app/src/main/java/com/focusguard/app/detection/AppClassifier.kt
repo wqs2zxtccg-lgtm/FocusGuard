@@ -118,7 +118,14 @@ object AppClassifier {
         "com.alibaba.android.rimet"          to AppCategory.SOCIAL,  // 钉钉（办公，但需 AI 确认场景）
     )
 
-
+    /**
+     * 只查内置静态表，即「高可信度分类」。
+     *
+     * 与 [resolveCategory] 的区别：不掺入元数据推断与自动学习的结果。
+     * 用于「无画面」这类没有任何画面佐证的判定——那里必须优先保证不误判，
+     * 只认手工维护过的明确娱乐应用（以及用户自己的覆盖）。
+     */
+    fun builtinCategory(packageName: String): AppCategory? = builtinMap[packageName]
 
     /**
      * 获取前台应用信息，并按四级优先级确定分类。

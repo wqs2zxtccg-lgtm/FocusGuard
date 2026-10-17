@@ -147,18 +147,24 @@ class MainActivity : ComponentActivity() {
         runCatching { com.focusguard.app.service.MemoReminder.sync(this) }
 
         // ── 守护自动恢复 ──────────────────────────────
-        // 曾开启 AI 守护但服务已中断（进程被杀 / MediaProjection 被系统回收）
-        // → 打开应用时自动重新请求屏幕录制授权并恢复检测。
-        // 这是"解锁后不再自动检测"的闭环修复：用户下次打开应用即恢复。
+        // 曾开启 AI 守护但服务已中断（进程被杀 / 屏幕共享被系统回收）
+        // → 打开应用时自动恢复检测。
+        // 优先走无障碍截图通道：不需要再弹一次"屏幕共享"授权框，
+        // 也不会因为息屏被系统结束共享；只有在没有无障碍时才回退到录屏授权。
         try {
             if (appSettings.serviceRunning &&
                 !com.focusguard.app.service.MonitorService.isRunning &&
                 !autoReauthAttempted
             ) {
                 autoReauthAttempted = true
-                screenCaptureLauncher.launch(
-                    mediaProjectionManager.createScreenCaptureIntent()
-                )
+                if (com.focusguard.app.access.GuardAccessibilityService.screenshotCapable) {
+                    com.focusguard.app.service.MonitorService.startWithoutScreenShare(this)
+                    serviceRunning = true
+                } else {
+                    screenCaptureLauncher.launch(
+                        mediaProjectionManager.createScreenCaptureIntent()
+                    )
+                }
             }
         } catch (e: Exception) {
             android.util.Log.w("MainActivity", "自动恢复守护失败：${e.message}")
@@ -715,7 +721,14 @@ class MainActivity : ComponentActivity() {
             Toast.makeText(this, "请先在设置中填写 API 密钥并保存", Toast.LENGTH_LONG).show()
             return
         }
-        // MediaProjection 授权每次启动都要重新申请，系统不允许复用
+        // 优先用无障碍截图通道：不弹系统授权框，也不会因为息屏"结束共享"
+        if (com.focusguard.app.access.GuardAccessibilityService.screenshotCapable) {
+            com.focusguard.app.service.MonitorService.startWithoutScreenShare(this)
+            serviceRunning = true
+            Toast.makeText(this, "已用无障碍截图通道开启守护（无需屏幕共享）", Toast.LENGTH_SHORT).show()
+            return
+        }
+        // 回退：MediaProjection 授权每次启动都要重新申请，系统不允许复用
         screenCaptureLauncher.launch(mediaProjectionManager.createScreenCaptureIntent())
     }
 

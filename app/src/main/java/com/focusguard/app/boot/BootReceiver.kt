@@ -82,10 +82,17 @@ class BootReceiver : BroadcastReceiver() {
                 LockScreenActivity.show(app)
             }
 
-            // 4. 守护服务（AI 检测）开机前在运行 → 提醒用户重新授权
+            // 4. 守护服务（AI 检测）开机前在运行 → 恢复
             val settings = Settings(app)
             if (settings.serviceRunning) {
-                notifyReopen(app)
+                // 先以"无画面模式"把守护拉起来：前台应用分类与媒体播放判定
+                // 完全不依赖屏幕共享，所以开机后守护能立刻继续生效；
+                // 若无障碍服务随后连上，画面通道会自动接上（无需用户操作）。
+                com.focusguard.app.service.MonitorService.startWithoutScreenShare(app)
+                // 一条画面通道都没有时，才提醒用户去开无障碍/重新授权录屏
+                if (!com.focusguard.app.access.GuardAccessibilityService.screenshotCapable) {
+                    notifyReopen(app)
+                }
             }
         } catch (e: Exception) {
             Log.w(TAG, "启动广播处理失败：${e.message}")
@@ -93,8 +100,10 @@ class BootReceiver : BroadcastReceiver() {
     }
 
     /**
-     * 提醒重新开启 AI 守护。
-     * MediaProjection 授权无法在后台自动重放，必须用户点一下。
+     * 提醒重新开启 AI 守护的画面识别。
+     *
+     * 守护本身已经以"无画面模式"自动恢复（见调用处），这里只是提示
+     * 用户可以补上画面通道：开无障碍，或重新确认屏幕共享授权。
      */
     private fun notifyReopen(context: Context) {
         try {
@@ -107,8 +116,8 @@ class BootReceiver : BroadcastReceiver() {
             )
             val notification = android.app.Notification.Builder(context, FocusGuardApp.CHANNEL_ID)
                 .setSmallIcon(com.focusguard.app.R.drawable.ic_shield)
-                .setContentTitle("AI 守护待重新开启")
-                .setContentText("屏幕录制授权需要重新确认，点击开启（锁机守护不受影响）")
+                .setContentTitle("守护已自动恢复（暂无画面通道）")
+                .setContentText("点此开启无障碍服务即可恢复画面识别（守护与锁机已在运行）")
                 .setContentIntent(pendingIntent)
                 .setAutoCancel(true)
                 .build()

@@ -5,6 +5,8 @@
     <!-- Screen capture -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+    <!-- 无画面守护模式：屏幕共享被系统结束后守护继续运行，此时前台服务类型为 specialUse -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <!-- 锁机守护前台服务（Android 14+ 要求声明具体类型） -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
@@ -139,11 +141,20 @@
             android:taskAffinity=""
             android:configChanges="orientation|screenSize|keyboardHidden" />
 
-        <!-- Monitor service（AI 检测，需要 MediaProjection） -->
+        <!-- Monitor service（AI 检测）。
+             两种前台服务类型：
+             · mediaProjection —— 正在使用屏幕共享采集画面
+             · specialUse     —— 屏幕共享已结束（多为息屏/锁屏），退化为
+                                 无障碍截图 + 应用分类 + 媒体播放状态的事件层判定
+             没有第二种类型时，Android 14+ 会在投影失效后拒绝以后台方式继续守护。 -->
         <service
             android:name=".service.MonitorService"
             android:exported="false"
-            android:foregroundServiceType="mediaProjection" />
+            android:foregroundServiceType="mediaProjection|specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="focus_guard_entertainment_monitor" />
+        </service>
 
         <!-- 锁机守护前台服务（不依赖无障碍，使用情况权限即可工作） -->
         <!-- 锁机自愈闹钟接收器（杀后台后 5 秒内强制恢复锁机） -->
