@@ -41,16 +41,23 @@ jobs:
 
       # 稳定签名密钥只保存在 GitHub Actions Secrets，不进入公开仓库。
       # 所有构建使用同一证书，支持后续 APK 覆盖安装升级。
-      # fork 里没有这些 Secret 时自动跳过：app/build.gradle.kts 会退回系统默认
-      # debug 签名，保证任何人拉下代码都能直接构建出可安装的 APK。
-      - name: 恢复稳定签名密钥（无 Secret 时自动跳过）
-        if: ${{ secrets.FOCUSGUARD_KEYSTORE_BASE64 != '' }}
+      # fork 里通常没有这些 Secret：此时本步直接跳过，app/build.gradle.kts
+      # 会自动退回系统默认 debug 签名，保证任何人都能构建出可安装的 APK。
+      #
+      # 注意：这里刻意**不用** `if: ${{ secrets.XXX != '' }}`。
+      # secrets 上下文在 step 级 if 里不可用，写了会让整个 workflow 解析失败
+      # （报 Unrecognized named-value: 'secrets'），连运行记录都不会产生。
+      - name: 恢复稳定签名密钥（未配置 Secret 时自动跳过）
         env:
           FOCUSGUARD_KEYSTORE_BASE64: ${{ secrets.FOCUSGUARD_KEYSTORE_BASE64 }}
           FOCUSGUARD_STORE_PASSWORD: ${{ secrets.FOCUSGUARD_STORE_PASSWORD }}
           FOCUSGUARD_KEY_ALIAS: ${{ secrets.FOCUSGUARD_KEY_ALIAS }}
           FOCUSGUARD_KEY_PASSWORD: ${{ secrets.FOCUSGUARD_KEY_PASSWORD }}
         run: |
+          if [ -z "$FOCUSGUARD_KEYSTORE_BASE64" ]; then
+            echo "::notice::未配置签名密钥，将使用默认 debug 签名构建"
+            exit 0
+          fi
           mkdir -p keystore
           printf '%s' "$FOCUSGUARD_KEYSTORE_BASE64" | base64 --decode > keystore/focusguard-release.p12
           chmod 600 keystore/focusguard-release.p12
