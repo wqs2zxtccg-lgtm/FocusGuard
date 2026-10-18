@@ -24,6 +24,7 @@ import com.focusguard.app.data.DetectionLog
 import com.focusguard.app.data.LockState
 import com.focusguard.app.data.LogStore
 import com.focusguard.app.data.Settings
+import com.focusguard.app.detection.AppCategory
 import com.focusguard.app.detection.AppCategoryStore
 import com.focusguard.app.detection.AppClassifier
 import com.focusguard.app.detection.DetectionOutcome
@@ -892,7 +893,8 @@ class MonitorService : Service() {
     /**
      * 达到执法条件时的处理：先弹横幅提醒 + 宽限期，再真正锁机。
      *
-     * 宽限期内用户切回学习类应用即可免锁——由 [gracePeriodJob] 复检前台应用。
+     * 宽限期内**只要离开娱乐现场就算免锁**：退回桌面、切到学习/社交/系统界面、
+     * 甚至直接息屏，都算「已退出」。由 [gracePeriodJob] 复检前台应用来判定。
      * 关闭"提醒后锁机"或宽限秒数为 0 时立即锁机（旧行为）。
      */
     private fun enforceWithAlert(outcome: DetectionOutcome): String {
@@ -915,27 +917,59 @@ class MonitorService : Service() {
             countdownSeconds = delaySeconds
         )
 
-        // 宽限期结束后复检：仍在娱乐 → 锁机；已收手 → 免锁
-        gracePeriodJob?.cancel()
+        // 宽限期结束后复检：仍在娱乐 → 锁机；已退出 → 免锁
+        //
+        // 已经在宽限期内就不再重复计时：否则每检测到一次娱乐就把倒计时重置一次，
+        // 用户一直赖着也能永远躲过锁机。
+        if (gracePeriodJob?.isActive == true) {
+            Log.d(TAG, "宽限期进行中，不重复计时")
+            return "WARN"
+        }
+
         gracePeriodJob = serviceScope.launch {
             try {
                 delay(delaySeconds * 1000L)
-                // 复检前台应用类别：已切到学习/中性应用则放行
+
+                // 「退出」的判定必须宽。旧实现写的是：
+                //     fg == null || classifyByAppInfo(fg) != "STUDY_WORK"
+                // 含义变成"只有切到学习类 App 才算退出"——
+                // 于是按 Home 退回桌面（SYSTEM/NEUTRAL）反而被判成"仍在娱乐"，
+                // 用户明明退出了还是被锁机。下面按"是否还在娱乐现场"重新判定。
                 val fg = AppClassifier.classifyForegroundApp(this@MonitorService, categoryStore)
-                val stillEntertainment = fg == null ||
-                    AppClassifier.classifyByAppInfo(fg) != "STUDY_WORK"
+                val stillEntertainment = when {
+                    // 已经息屏：用户不看了，别把他叫醒再锁机
+                    !isScreenInteractive() -> false
+                    // 读不到前台：宁可漏锁，也不能凭"读不到"就定罪
+                    fg == null -> false
+                    // 还赖在触发提醒的那个 App 里
+                    fg.packageName == outcome.packageName -> true
+                    // 换个游戏继续
+                    fg.category == AppCategory.GAME -> true
+                    // 换个视频 App 继续（B 站 / 抖音 / 快手 ……）
+                    fg.category == AppCategory.VIDEO -> true
+                    fg.category == AppCategory.SHORT_VIDEO -> true
+                    // 桌面、系统界面、学习类、社交、未知 → 都算已经退出
+                    else -> false
+                }
 
                 if (!stillEntertainment) {
-                    Log.d(TAG, "宽限期内已切回学习状态，免除锁机")
+                    val fgPkg = fg?.packageName.orEmpty()
+                    val fgLabel = fg?.label.orEmpty()
+                    Log.d(
+                        TAG,
+                        "宽限期内已退出娱乐应用（前台=${fgPkg.ifBlank { "读不到" }}），免除锁机"
+                    )
                     AlertNotifier.cancelAlert(this@MonitorService)
                     logStore.addLog(
                         DetectionLog(
-                            classification = "STUDY_WORK",
+                            classification = "NEUTRAL",
                             confidence = 1f,
-                            reason = "宽限期内主动切回学习状态，免除锁机",
+                            reason = "宽限期内已退出娱乐应用（前台：" +
+                                fgLabel.ifBlank { fgPkg.ifBlank { "未知" } } +
+                                "），免除锁机",
                             action = "NONE",
                             source = DetectionSource.APP_CATEGORY.name,
-                            appLabel = fg?.label.orEmpty()
+                            appLabel = fgLabel
                         )
                     )
                     return@launch
