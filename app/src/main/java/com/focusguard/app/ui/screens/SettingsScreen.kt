@@ -96,7 +96,7 @@ fun SettingsScreen(
             OutlinedTextField(
                 value = apiBaseUrl, onValueChange = { apiBaseUrl = it },
                 label = { Text("API 地址") },
-                placeholder = { Text("https://api.moonshot.cn/v1") },
+                placeholder = { Text("https://api.deepseek.com/v1") },
                 modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp)
             )
             Spacer(Modifier.height(8.dp))
@@ -109,7 +109,7 @@ fun SettingsScreen(
             OutlinedTextField(
                 value = modelName, onValueChange = { modelName = it },
                 label = { Text("模型名称") },
-                placeholder = { Text("moonshot-v1-8k-vision-preview") },
+                placeholder = { Text("deepseek-flash") },
                 modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp)
             )
             Spacer(Modifier.height(8.dp))
@@ -122,6 +122,7 @@ fun SettingsScreen(
             )
             Spacer(Modifier.height(4.dp))
             val presets = listOf(
+                "DeepSeek" to Triple("openai", "https://api.deepseek.com/v1", "deepseek-flash"),
                 "OpenAI" to Triple("openai", "https://api.openai.com/v1", "gpt-4o-mini"),
                 "Kimi" to Triple("openai", "https://api.moonshot.cn/v1", "moonshot-v1-8k-vision-preview"),
                 "GLM 智谱" to Triple("openai", "https://open.bigmodel.cn/api/paas/v4", "glm-4v-flash"),

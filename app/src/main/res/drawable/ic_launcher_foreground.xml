@@ -1,19 +1,22 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- 自适应图标前景：白色盾牌 + 蓝色对勾（安全区内 35~73 / 29~79.5） -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="108dp"
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
-    <group
-        android:scaleX="2.6"
-        android:scaleY="2.6"
-        android:translateX="22.8"
-        android:translateY="22.8">
-        <path
-            android:fillColor="#E2A65D"
-            android:pathData="M12,1L3,5v6c0,5.55 3.84,10.74 9,12 5.16,-1.26 9,-6.45 9,-12V5L12,1z" />
-        <path
-            android:fillColor="#0E1217"
-            android:pathData="M10.6,15.4l-2.8,-2.8 1.4,-1.4 1.4,1.4 4.2,-4.2 1.4,1.4z" />
-    </group>
+
+    <!-- 盾牌主体 -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M54,29 L73,36.5 L73,54 C73,65.5 64.8,73.8 54,79.5 C43.2,73.8 35,65.5 35,54 L35,36.5 Z" />
+
+    <!-- 内嵌对勾：圆头描边，比实心箭头更清爽 -->
+    <path
+        android:pathData="M43.5,54.5 L51,62 L66,45.5"
+        android:strokeColor="#1D4ED8"
+        android:strokeWidth="6.5"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:fillColor="#00000000" />
 </vector>

@@ -1,4 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <color name="ic_launcher_background">#0E1217</color>
+    <!-- 启动图标底色：蓝色（与 drawable/ic_launcher_bg.xml 的渐变同色系） -->
+    <color name="ic_launcher_background">#1D4ED8</color>
 </resources>

@@ -163,7 +163,8 @@ gacha
     
     // API settings
     var apiBaseUrl: String
-        get() = prefs.getString(KEY_API_BASE_URL, "https://api.moonshot.cn/v1") ?: "https://api.moonshot.cn/v1"
+        get() = prefs.getString(KEY_API_BASE_URL, "https://api.deepseek.com/v1")
+            ?: "https://api.deepseek.com/v1"
         set(value) = prefs.edit().putString(KEY_API_BASE_URL, value).apply()
 
     /**
@@ -199,8 +200,8 @@ gacha
     
     var modelName: String
         get() {
-            val raw = prefs.getString(KEY_MODEL_NAME, "moonshot-v1-8k-vision-preview")
-                ?: "moonshot-v1-8k-vision-preview"
+            val raw = prefs.getString(KEY_MODEL_NAME, "deepseek-flash")
+                ?: "deepseek-flash"
             // 已下架 Gemini 模型的自动迁移（Google 停新用户后旧模型名返回 404）
             return when (raw) {
                 "gemini-1.5-flash", "gemini-1.5-pro",
