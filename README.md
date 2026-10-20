@@ -1,8 +1,32 @@
-# FocusGuard (专注卫士)
+# FocusGuard (专注卫士) · 修改版
+
+> **📦 下载 APK**：[`FocusGuard-2.0.apk`](https://github.com/wqs2zxtccg-lgtm/FocusGuard/releases/download/v2.0/FocusGuard-2.0.apk)
+> · [发布说明](https://github.com/wqs2zxtccg-lgtm/FocusGuard/releases/tag/v2.0)
+>
+> 本仓库是上游 [mengcha114/FocusGuard](https://github.com/mengcha114/FocusGuard) 的**修改版**，
+> 基于 `v3.10.0` 修改，主要解决「息屏后守护失效」和「退出了仍被锁机」两个问题。
+> `SHA256: f393f68d39129f7507849ea6a80294a7be779faac275fb0f7de91c09bd610deb`
 
 > ⚠️ **软件目前处于早期测试阶段，功能与架构仍在密集调整中，可能存在各种问题，请谨慎使用。**
 
 FocusGuard 是一款 Android 自律辅助应用。它会定期看一眼屏幕，通过 AI 判断你是在学习还是在玩，如果发现你在娱乐，就会把手机锁起来，让你专心做事。
+
+---
+
+## 修改版改动一览
+
+| # | 改动 | 说明 |
+|---|---|---|
+| 1 | **守护与屏幕共享解耦** | 息屏 / 锁屏 / 系统回收 MediaProjection 后，守护**不再停止**。旧实现是在投影失效回调里直接 `stopMonitoring()` |
+| 2 | **新增无障碍截图通道** | API 30+ 可自行截屏，**不需要屏幕共享授权框**，也不会因息屏被系统"结束共享"；与屏幕共享自动切换 |
+| 3 | **新增事件层判定** | 无画面时改用「媒体播放状态 + 高可信度应用分类」，零 token；社交类不参与判定，避免听歌/听语音被误锁 |
+| 4 | **修复 15 秒宽限期** | 旧实现只有切到"学习类 App"才免锁，退回桌面反而被判仍在娱乐。现在**退回桌面 / 切学习或社交 / 息屏 / 读不到前台 都免锁**；宽限期内不再重复计时 |
+| 5 | **默认改用 DeepSeek** | `https://api.deepseek.com/v1` + `deepseek-flash`，设置页加了 DeepSeek 一键填充 |
+| 6 | **图标改为蓝色** | 蓝色渐变底 + 白色盾牌 + 蓝色对勾，支持 Android 13+ 主题图标 |
+| 7 | **构建更友好** | 没有签名密钥的 fork 也能直接构建（自动退回默认 debug 签名）；CI 用 `sh gradlew` 避免可执行位问题 |
+
+> ⚠️ **安装提示**：每个构建用的是各自生成的 debug 签名，**覆盖安装旧版会失败**，请先卸载再装。
+> 若检测时提示模型不存在，把模型名改成 `deepseek-chat`（DeepSeek 官方名称）。
 
 ---
 ## 作者的话
